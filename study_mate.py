@@ -51,10 +51,10 @@ st.sidebar.header("⚙️ Settings")
 mode = st.sidebar.radio("Choose Study Mode:", list(PERSONAS.keys()))
 temperature = st.sidebar.slider("Creativity Level", 0.0, 1.0, 0.3)
 model_choice = st.sidebar.selectbox("Choose Model:", [
-    "llama3-8b-8192",
-    "llama3-70b-8192",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it"
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+    "deepseek-r1-distill-llama-70b"
 ])
 
 # -----------------------------
