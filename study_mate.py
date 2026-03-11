@@ -1,6 +1,7 @@
 import streamlit as st
 import io
-from langchain_community.document_loaders import PyPDFLoader
+import tempfile
+import os
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -62,7 +63,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # -----------------------------
-# PROCESS PDF (in-memory, no disk writing)
+# PROCESS PDF
 # -----------------------------
 if uploaded_file:
     file_key = uploaded_file.name
@@ -70,19 +71,23 @@ if uploaded_file:
     if "vectorstore" not in st.session_state or st.session_state.get("file_key") != file_key:
         with st.spinner("🔄 Processing your document..."):
 
-            # Read PDF directly from memory
-            pdf_bytes = uploaded_file.read()
-            pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            # Write to a proper temp file on disk (most reliable cross-platform)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded_file.getvalue())
+                tmp_path = tmp.name
 
-            # Extract text into Document objects
-            pages = []
-            for i, page in enumerate(pdf_reader.pages):
-                text = page.extract_text()
-                if text and text.strip():
-                    pages.append(Document(
-                        page_content=text,
-                        metadata={"page": i + 1, "source": uploaded_file.name}
-                    ))
+            try:
+                pdf_reader = pypdf.PdfReader(tmp_path)
+                pages = []
+                for i, page in enumerate(pdf_reader.pages):
+                    text = page.extract_text()
+                    if text and text.strip():
+                        pages.append(Document(
+                            page_content=text,
+                            metadata={"page": i + 1, "source": uploaded_file.name}
+                        ))
+            finally:
+                os.remove(tmp_path)
 
             if not pages:
                 st.error("❌ Could not extract text from this PDF. It may be scanned or image-based.")
@@ -117,7 +122,7 @@ if uploaded_file:
         with st.chat_message("user"):
             st.markdown(user_query)
 
-        # Build conversation history for context
+        # Build conversation history
         conversation_history = ""
         if len(st.session_state.messages) > 1:
             for msg in st.session_state.messages[:-1]:
