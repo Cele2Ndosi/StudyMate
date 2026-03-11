@@ -1,5 +1,5 @@
 import streamlit as st
-import os
+import io
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -8,19 +8,27 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
 import warnings
+import pypdf
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="StudyMate AI", page_icon="🎓", layout="wide")
 st.title("🎓 StudyMate AI")
 st.markdown("### Your Personalized AI Study Companion")
 
+# -----------------------------
+# GROQ API KEY
+# -----------------------------
 try:
     groq_api_key = st.secrets["GROQ_API_KEY"]
 except Exception:
     st.error("⚠️ Service unavailable. Please contact the administrator.")
     st.stop()
 
+# -----------------------------
+# SYSTEM PERSONAS
+# -----------------------------
 PERSONAS = {
     "Summarize": "Summarize the following context into concise bullet points.",
     "Professor": "Explain the context like a friendly college professor using analogies and simple examples.",
@@ -28,6 +36,9 @@ PERSONAS = {
     "Socratic Tutor": "Do NOT give the final answer. Guide the student using hints and thoughtful questions."
 }
 
+# -----------------------------
+# SIDEBAR SETTINGS
+# -----------------------------
 st.sidebar.header("⚙️ Settings")
 mode = st.sidebar.radio("Choose Study Mode:", list(PERSONAS.keys()))
 temperature = st.sidebar.slider("Creativity Level", 0.0, 1.0, 0.3)
@@ -42,21 +53,40 @@ if st.sidebar.button("🗑️ Clear Chat History"):
     st.session_state.messages = []
     st.rerun()
 
+# -----------------------------
+# FILE UPLOAD
+# -----------------------------
 uploaded_file = st.file_uploader("📄 Upload your study PDF", type="pdf")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# -----------------------------
+# PROCESS PDF (in-memory, no disk writing)
+# -----------------------------
 if uploaded_file:
     file_key = uploaded_file.name
 
     if "vectorstore" not in st.session_state or st.session_state.get("file_key") != file_key:
         with st.spinner("🔄 Processing your document..."):
-            with open("temp.pdf", "wb") as f:
-                f.write(uploaded_file.getvalue())
 
-            loader = PyPDFLoader("temp.pdf")
-            pages = loader.load()
+            # Read PDF directly from memory
+            pdf_bytes = uploaded_file.read()
+            pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+
+            # Extract text into Document objects
+            pages = []
+            for i, page in enumerate(pdf_reader.pages):
+                text = page.extract_text()
+                if text and text.strip():
+                    pages.append(Document(
+                        page_content=text,
+                        metadata={"page": i + 1, "source": uploaded_file.name}
+                    ))
+
+            if not pages:
+                st.error("❌ Could not extract text from this PDF. It may be scanned or image-based.")
+                st.stop()
 
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
             docs = text_splitter.split_documents(pages)
@@ -67,13 +97,19 @@ if uploaded_file:
             st.session_state.vectorstore = vectorstore
             st.session_state.file_key = file_key
             st.session_state.messages = []
-            os.remove("temp.pdf")
+
         st.success("✅ Document ready! Ask your first question below.")
 
+    # -----------------------------
+    # DISPLAY CHAT HISTORY
+    # -----------------------------
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    # -----------------------------
+    # CHAT INPUT
+    # -----------------------------
     user_query = st.chat_input("❓ Ask a question about your document...")
 
     if user_query:
@@ -81,6 +117,7 @@ if uploaded_file:
         with st.chat_message("user"):
             st.markdown(user_query)
 
+        # Build conversation history for context
         conversation_history = ""
         if len(st.session_state.messages) > 1:
             for msg in st.session_state.messages[:-1]:
