@@ -11,32 +11,16 @@ from langchain_core.output_parsers import StrOutputParser
 import warnings
 warnings.filterwarnings("ignore")
 
-# -----------------------------
-# PAGE CONFIG
-# -----------------------------
 st.set_page_config(page_title="StudyMate AI", page_icon="🎓", layout="wide")
 st.title("🎓 StudyMate AI")
 st.markdown("### Your Personalized AI Study Companion")
 
-# -----------------------------
-# GROQ API KEY
-# -----------------------------
-# Tries Streamlit secrets first (cloud), falls back to sidebar input (local)
-groq_api_key = None
-
 try:
     groq_api_key = st.secrets["GROQ_API_KEY"]
 except Exception:
-    pass
+    st.error("⚠️ Service unavailable. Please contact the administrator.")
+    st.stop()
 
-if not groq_api_key:
-    groq_api_key = st.sidebar.text_input("🔑 Enter Groq API Key", type="password")
-    if not groq_api_key:
-        st.sidebar.warning("API key required. Get one free at https://console.groq.com")
-
-# -----------------------------
-# SYSTEM PERSONAS
-# -----------------------------
 PERSONAS = {
     "Summarize": "Summarize the following context into concise bullet points.",
     "Professor": "Explain the context like a friendly college professor using analogies and simple examples.",
@@ -44,9 +28,6 @@ PERSONAS = {
     "Socratic Tutor": "Do NOT give the final answer. Guide the student using hints and thoughtful questions."
 }
 
-# -----------------------------
-# SIDEBAR SETTINGS
-# -----------------------------
 st.sidebar.header("⚙️ Settings")
 mode = st.sidebar.radio("Choose Study Mode:", list(PERSONAS.keys()))
 temperature = st.sidebar.slider("Creativity Level", 0.0, 1.0, 0.3)
@@ -57,93 +38,93 @@ model_choice = st.sidebar.selectbox("Choose Model:", [
     "deepseek-r1-distill-llama-70b"
 ])
 
-# -----------------------------
-# FILE UPLOAD
-# -----------------------------
+if st.sidebar.button("🗑️ Clear Chat History"):
+    st.session_state.messages = []
+    st.rerun()
+
 uploaded_file = st.file_uploader("📄 Upload your study PDF", type="pdf")
-user_query = st.text_input("❓ What do you want to learn?")
 
-if not groq_api_key:
-    st.info("👈 Please enter your Groq API key in the sidebar to get started.")
-    st.stop()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-if uploaded_file and user_query:
+if uploaded_file:
     file_key = uploaded_file.name
 
     if "vectorstore" not in st.session_state or st.session_state.get("file_key") != file_key:
         with st.spinner("🔄 Processing your document..."):
-            # Save temp file
             with open("temp.pdf", "wb") as f:
                 f.write(uploaded_file.getvalue())
 
-            # Load PDF
             loader = PyPDFLoader("temp.pdf")
             pages = loader.load()
 
-            # Split text
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
             docs = text_splitter.split_documents(pages)
 
-            # Embeddings (free, runs locally, no API needed)
             embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-            # Vector store
             vectorstore = FAISS.from_documents(docs, embeddings)
 
             st.session_state.vectorstore = vectorstore
             st.session_state.file_key = file_key
+            st.session_state.messages = []
             os.remove("temp.pdf")
-    else:
-        vectorstore = st.session_state.vectorstore
+        st.success("✅ Document ready! Ask your first question below.")
 
-    # -----------------------------
-    # PROMPT TEMPLATE
-    # -----------------------------
-    template = f"""
-    {PERSONAS[mode]}
-    Use ONLY the context below to answer the question.
-    If the answer is not in the context, say "The answer is not found in the document."
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    Context:
-    {{context}}
+    user_query = st.chat_input("❓ Ask a question about your document...")
 
-    Question:
-    {{question}}
+    if user_query:
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
 
-    Answer:
-    """
+        conversation_history = ""
+        if len(st.session_state.messages) > 1:
+            for msg in st.session_state.messages[:-1]:
+                role = "Student" if msg["role"] == "user" else "Assistant"
+                conversation_history += f"{role}: {msg['content']}\n"
 
-    QA_PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
+        template = f"""
+        {PERSONAS[mode]}
+        Use ONLY the context below to answer the question.
+        If the answer is not in the context, say "The answer is not found in the document."
 
-    # -----------------------------
-    # GROQ LLM
-    # -----------------------------
-    llm = ChatGroq(
-        model=model_choice,
-        temperature=temperature,
-        api_key=groq_api_key
-    )
+        Context:
+        {{context}}
 
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
+        Previous conversation:
+        {conversation_history}
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        Current Question:
+        {{question}}
 
-    qa_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | QA_PROMPT
-        | llm
-        | StrOutputParser()
-    )
+        Answer:
+        """
 
-    with st.spinner("🧠 Generating response..."):
-        response = qa_chain.invoke(user_query)
+        QA_PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
+        llm = ChatGroq(model=model_choice, temperature=temperature, api_key=groq_api_key)
 
-    st.success("✅ Done!")
-    st.markdown("## 📚 StudyMate Response")
-    st.write(response)
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
 
-elif uploaded_file and not user_query:
-    st.info("💬 PDF uploaded! Now type your question above.")
-elif not uploaded_file:
+        retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
+
+        qa_chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | QA_PROMPT
+            | llm
+            | StrOutputParser()
+        )
+
+        with st.chat_message("assistant"):
+            with st.spinner("🧠 Thinking..."):
+                response = qa_chain.invoke(user_query)
+            st.markdown(response)
+
+        st.session_state.messages.append({"role": "assistant", "content": response})
+
+else:
     st.info("📄 Please upload a PDF to get started.")
