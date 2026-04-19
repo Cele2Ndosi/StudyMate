@@ -6,6 +6,8 @@ import json
 import warnings
 import pypdf
 import pandas as pd
+import datetime
+import uuid
 
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -19,21 +21,96 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="StudyMate AI", page_icon="🎓", layout="wide")
-st.title("🎓 StudyMate AI")
-st.markdown("### Your Personalized AI Study Companion")
 
-# -----------------------------
-# GROQ API KEY
-# -----------------------------
+# ================================================================
+# PERSISTENCE LAYER
+# Sessions are stored as JSON files in ./sessions/
+# Each session = { id, name, created_at, updated_at,
+#                  input_mode, topic, messages: [{role, content}] }
+# ================================================================
+SESSIONS_DIR = "sessions"
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+
+def _session_path(session_id: str) -> str:
+    return os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+
+def list_sessions() -> list[dict]:
+    """Return all saved sessions sorted by most recently updated."""
+    sessions = []
+    for fname in os.listdir(SESSIONS_DIR):
+        if fname.endswith(".json"):
+            try:
+                with open(os.path.join(SESSIONS_DIR, fname), "r") as f:
+                    sessions.append(json.load(f))
+            except Exception:
+                pass
+    return sorted(sessions, key=lambda s: s.get("updated_at", ""), reverse=True)
+
+
+def save_session(session: dict):
+    """Write a session dict to disk."""
+    session["updated_at"] = datetime.datetime.now().isoformat()
+    with open(_session_path(session["id"]), "w") as f:
+        json.dump(session, f, indent=2)
+
+
+def load_session(session_id: str) -> dict | None:
+    """Load a session from disk by id."""
+    path = _session_path(session_id)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
+
+
+def delete_session(session_id: str):
+    """Delete a session file from disk."""
+    path = _session_path(session_id)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def new_session(name: str = "", input_mode: str = "", topic: str = "") -> dict:
+    """Create a fresh session dict (not yet saved)."""
+    return {
+        "id": str(uuid.uuid4()),
+        "name": name or f"Session {datetime.datetime.now().strftime('%b %d, %H:%M')}",
+        "created_at": datetime.datetime.now().isoformat(),
+        "updated_at": datetime.datetime.now().isoformat(),
+        "input_mode": input_mode,
+        "topic": topic,
+        "messages": [],   # [{role, content}]
+    }
+
+
+def export_session_as_txt(session: dict) -> str:
+    """Render a session's chat history as plain text for download."""
+    lines = [
+        f"StudyMate AI — {session['name']}",
+        f"Created: {session['created_at'][:16].replace('T', ' ')}",
+        f"Topic / Source: {session.get('topic', 'N/A')}",
+        "=" * 60,
+        "",
+    ]
+    for msg in session.get("messages", []):
+        role = "You" if msg["role"] == "user" else "StudyMate AI"
+        lines.append(f"[{role}]")
+        lines.append(msg["content"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ================================================================
+# APP CONFIG / CONSTANTS
+# ================================================================
 try:
     groq_api_key = st.secrets["GROQ_API_KEY"]
 except Exception:
     st.error("⚠️ Service unavailable. Please contact the administrator.")
     st.stop()
 
-# -----------------------------
-# SYSTEM PERSONAS
-# -----------------------------
 PERSONAS = {
     "Summarize": "You summarize content into concise bullet points. Build on previous summaries if the student asks follow-up questions.",
     "Professor": "You are a friendly college professor who explains concepts using analogies and simple examples. Remember what you have already taught the student and build on it.",
@@ -53,22 +130,12 @@ PERSONAS = {
     ),
 }
 
-# -----------------------------
-# SUPPORTED FILE TYPES
-# -----------------------------
 SUPPORTED_EXTENSIONS = [
-    # Documents
-    "pdf", "docx", "doc", "odt", "rtf",
-    # Presentations
-    "pptx", "ppt",
-    # Spreadsheets
+    "pdf", "docx", "doc", "odt", "rtf", "pptx", "ppt",
     "xlsx", "xls", "xlsm", "ods", "csv", "tsv",
-    # Text / Code / Data
     "txt", "md", "py", "js", "ts", "html", "css", "java",
     "c", "cpp", "cs", "go", "rs", "rb", "php", "swift",
-    "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "log",
-    # Notebooks
-    "ipynb",
+    "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "log", "ipynb",
 ]
 
 FILE_TYPE_LABELS = {
@@ -90,17 +157,15 @@ FILE_TYPE_LABELS = {
 }
 
 
-# -----------------------------------------------
-# TEXT EXTRACTION — handles all supported formats
-# -----------------------------------------------
+# ================================================================
+# FILE EXTRACTION
+# ================================================================
 def extract_text_from_file(uploaded_file) -> str:
-    """Extract plain text from any supported file type."""
     filename = uploaded_file.name
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     raw = uploaded_file.read()
     buf = io.BytesIO(raw)
 
-    # PDF
     if ext == "pdf":
         reader = pypdf.PdfReader(buf)
         pages = []
@@ -112,7 +177,6 @@ def extract_text_from_file(uploaded_file) -> str:
             raise ValueError("Could not extract text from this PDF. It may be scanned or image-based.")
         return "\n\n".join(pages)
 
-    # Word / ODT / RTF / EPUB — try docx2txt then pandoc fallback
     elif ext in ("docx", "odt", "rtf", "epub"):
         tmp = f"/tmp/_studymate_upload.{ext}"
         with open(tmp, "wb") as f:
@@ -126,61 +190,44 @@ def extract_text_from_file(uploaded_file) -> str:
             pass
         try:
             import subprocess
-            result = subprocess.run(
-                ["pandoc", tmp, "-t", "plain"],
-                capture_output=True, text=True, timeout=30
-            )
+            result = subprocess.run(["pandoc", tmp, "-t", "plain"], capture_output=True, text=True, timeout=30)
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
         except Exception:
             pass
-        raise ValueError(f"Could not extract text from {ext.upper()} file. Try converting to PDF or TXT first.")
+        raise ValueError(f"Could not extract text from {ext.upper()} file.")
 
-    # PowerPoint
     elif ext in ("pptx", "ppt"):
-        try:
-            from pptx import Presentation
-            prs = Presentation(buf)
-            slides = []
-            for i, slide in enumerate(prs.slides):
-                texts = [
-                    shape.text.strip()
-                    for shape in slide.shapes
-                    if hasattr(shape, "text") and shape.text.strip()
-                ]
-                if texts:
-                    slides.append(f"[Slide {i+1}]\n" + "\n".join(texts))
-            if not slides:
-                raise ValueError("No text found in presentation.")
-            return "\n\n".join(slides)
-        except ImportError:
-            raise ValueError("python-pptx is required. Run: pip install python-pptx")
+        from pptx import Presentation
+        prs = Presentation(buf)
+        slides = []
+        for i, slide in enumerate(prs.slides):
+            texts = [s.text.strip() for s in slide.shapes if hasattr(s, "text") and s.text.strip()]
+            if texts:
+                slides.append(f"[Slide {i+1}]\n" + "\n".join(texts))
+        if not slides:
+            raise ValueError("No text found in presentation.")
+        return "\n\n".join(slides)
 
-    # Excel / ODS
     elif ext in ("xlsx", "xlsm"):
         df_dict = pd.read_excel(buf, sheet_name=None, engine="openpyxl")
-        return "\n\n".join(f"[Sheet: {name}]\n{df.to_string(index=False)}" for name, df in df_dict.items())
+        return "\n\n".join(f"[Sheet: {n}]\n{df.to_string(index=False)}" for n, df in df_dict.items())
 
     elif ext == "ods":
         df_dict = pd.read_excel(buf, sheet_name=None, engine="odf")
-        return "\n\n".join(f"[Sheet: {name}]\n{df.to_string(index=False)}" for name, df in df_dict.items())
+        return "\n\n".join(f"[Sheet: {n}]\n{df.to_string(index=False)}" for n, df in df_dict.items())
 
     elif ext == "xls":
         df_dict = pd.read_excel(buf, sheet_name=None, engine="xlrd")
-        return "\n\n".join(f"[Sheet: {name}]\n{df.to_string(index=False)}" for name, df in df_dict.items())
+        return "\n\n".join(f"[Sheet: {n}]\n{df.to_string(index=False)}" for n, df in df_dict.items())
 
-    # CSV / TSV
     elif ext in ("csv", "tsv"):
-        sep = "\t" if ext == "tsv" else ","
-        df = pd.read_csv(buf, sep=sep)
+        df = pd.read_csv(buf, sep="\t" if ext == "tsv" else ",")
         return df.to_string(index=False)
 
-    # JSON
     elif ext == "json":
-        data = json.load(buf)
-        return json.dumps(data, indent=2)
+        return json.dumps(json.load(buf), indent=2)
 
-    # JSONL
     elif ext == "jsonl":
         lines = raw.decode("utf-8", errors="replace").strip().split("\n")
         parsed = []
@@ -191,28 +238,22 @@ def extract_text_from_file(uploaded_file) -> str:
                 parsed.append(line)
         return "\n".join(parsed)
 
-    # Jupyter Notebook
     elif ext == "ipynb":
         nb = json.loads(raw.decode("utf-8", errors="replace"))
         cells = []
         for cell in nb.get("cells", []):
-            ct = cell.get("cell_type", "")
             src = "".join(cell.get("source", []))
             if src.strip():
-                label = "# CODE CELL" if ct == "code" else "# MARKDOWN"
+                label = "# CODE CELL" if cell.get("cell_type") == "code" else "# MARKDOWN"
                 cells.append(f"{label}\n{src.strip()}")
         return "\n\n".join(cells)
 
-    # Plain text, code, config, markup
-    elif ext in (
-        "txt", "md", "py", "js", "ts", "html", "css", "java",
-        "c", "cpp", "cs", "go", "rs", "rb", "php", "swift",
-        "xml", "yaml", "yml", "toml", "ini", "log",
-    ):
+    elif ext in ("txt", "md", "py", "js", "ts", "html", "css", "java",
+                 "c", "cpp", "cs", "go", "rs", "rb", "php", "swift",
+                 "xml", "yaml", "yml", "toml", "ini", "log"):
         return raw.decode("utf-8", errors="replace")
 
     else:
-        # Last-ditch UTF-8 decode
         decoded = raw.decode("utf-8", errors="replace")
         if decoded.strip():
             return decoded
@@ -220,7 +261,6 @@ def extract_text_from_file(uploaded_file) -> str:
 
 
 def build_vectorstore(text: str, source_name: str):
-    """Chunk text and build a FAISS vectorstore."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
     docs = text_splitter.create_documents([text], metadatas=[{"source": source_name}])
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -228,7 +268,6 @@ def build_vectorstore(text: str, source_name: str):
 
 
 def run_rag_chat(user_query: str, retriever, llm, persona: str) -> str:
-    """Retrieve relevant chunks and run the LLM chain."""
     prompt = ChatPromptTemplate.from_messages([
         ("system", f"""{persona}
 
@@ -251,54 +290,193 @@ Document Context:
     })
 
 
-# -----------------------------
-# SIDEBAR SETTINGS
-# -----------------------------
+def lc_history_from_messages(messages: list[dict]) -> list:
+    """Rebuild LangChain message objects from saved message dicts."""
+    history = []
+    for m in messages:
+        if m["role"] == "user":
+            history.append(HumanMessage(content=m["content"]))
+        elif m["role"] == "assistant":
+            history.append(AIMessage(content=m["content"]))
+    return history
+
+
+# ================================================================
+# SESSION STATE BOOTSTRAP
+# ================================================================
+if "current_session" not in st.session_state:
+    st.session_state.current_session = None   # dict or None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+
+# ================================================================
+# SIDEBAR — Sessions Manager + Settings
+# ================================================================
+st.sidebar.title("🎓 StudyMate AI")
+
+# ── Settings ─────────────────────────────────────────────────
 st.sidebar.header("⚙️ Settings")
-mode = st.sidebar.radio("Choose Study Mode:", list(PERSONAS.keys()))
+mode = st.sidebar.radio("Study Mode:", list(PERSONAS.keys()))
 temperature = st.sidebar.slider("Creativity Level", 0.0, 1.0, 0.3)
-model_choice = st.sidebar.selectbox("Choose Model:", [
+model_choice = st.sidebar.selectbox("Model:", [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "gemma2-9b-it",
     "deepseek-r1-distill-llama-70b"
 ])
 
-if st.sidebar.button("🗑️ Clear Chat History"):
-    for key in ["messages", "chat_history", "vectorstore", "file_key",
-                "image_data", "image_media_type", "image_hash", "free_topic"]:
-        st.session_state.pop(key, None)
-    st.session_state.messages = []
-    st.session_state.chat_history = []
-    st.rerun()
+st.sidebar.markdown("---")
+
+# ── Session controls ─────────────────────────────────────────
+st.sidebar.header("💾 Sessions")
+
+col_new, col_clear = st.sidebar.columns(2)
+with col_new:
+    if st.button("＋ New", use_container_width=True, help="Start a brand-new session"):
+        sess = new_session()
+        save_session(sess)
+        st.session_state.current_session = sess
+        st.session_state.messages = []
+        st.session_state.chat_history = []
+        for k in ["vectorstore", "file_key", "image_data", "image_media_type", "image_hash", "free_topic"]:
+            st.session_state.pop(k, None)
+        st.rerun()
+
+with col_clear:
+    if st.button("🗑️ Clear", use_container_width=True, help="Clear current chat (keeps session)"):
+        st.session_state.messages = []
+        st.session_state.chat_history = []
+        if st.session_state.current_session:
+            st.session_state.current_session["messages"] = []
+            save_session(st.session_state.current_session)
+        st.rerun()
+
+# ── Rename current session ────────────────────────────────────
+if st.session_state.current_session:
+    with st.sidebar.expander("✏️ Rename current session"):
+        new_name = st.text_input(
+            "Session name",
+            value=st.session_state.current_session.get("name", ""),
+            key="rename_input",
+            label_visibility="collapsed",
+        )
+        if st.button("Save name", key="save_name"):
+            st.session_state.current_session["name"] = new_name.strip() or st.session_state.current_session["name"]
+            save_session(st.session_state.current_session)
+            st.rerun()
+
+# ── Download current session ──────────────────────────────────
+if st.session_state.current_session and st.session_state.messages:
+    txt = export_session_as_txt(st.session_state.current_session)
+    safe_name = st.session_state.current_session["name"].replace(" ", "_")[:40]
+    st.sidebar.download_button(
+        label="⬇️ Download notes (.txt)",
+        data=txt,
+        file_name=f"{safe_name}.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+st.sidebar.markdown("---")
+
+# ── Saved sessions list ───────────────────────────────────────
+st.sidebar.subheader("📚 Saved Sessions")
+all_sessions = list_sessions()
+
+if not all_sessions:
+    st.sidebar.caption("No saved sessions yet. Start chatting to auto-save!")
+else:
+    for sess in all_sessions:
+        is_active = (
+            st.session_state.current_session is not None
+            and st.session_state.current_session["id"] == sess["id"]
+        )
+        label = ("▶ " if is_active else "") + sess["name"]
+        updated = sess.get("updated_at", "")[:16].replace("T", " ")
+        msg_count = len(sess.get("messages", []))
+
+        with st.sidebar.container():
+            col_btn, col_del = st.sidebar.columns([4, 1])
+            with col_btn:
+                btn_label = f"**{label}**\n{updated} · {msg_count} msgs" if is_active else f"{label}\n{updated} · {msg_count} msgs"
+                if st.button(
+                    label,
+                    key=f"load_{sess['id']}",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                ):
+                    if not is_active:
+                        # Load this session into active state
+                        st.session_state.current_session = sess
+                        st.session_state.messages = sess.get("messages", [])
+                        st.session_state.chat_history = lc_history_from_messages(sess.get("messages", []))
+                        # Clear stale file/image state — user must re-upload
+                        for k in ["vectorstore", "file_key", "image_data", "image_media_type", "image_hash"]:
+                            st.session_state.pop(k, None)
+                        st.session_state.free_topic = sess.get("topic", "")
+                        st.rerun()
+            with col_del:
+                if st.button("🗑", key=f"del_{sess['id']}", help="Delete this session"):
+                    delete_session(sess["id"])
+                    if is_active:
+                        st.session_state.current_session = None
+                        st.session_state.messages = []
+                        st.session_state.chat_history = []
+                    st.rerun()
 
 with st.sidebar.expander("📂 Supported File Types"):
     st.markdown("""
-**Documents:** PDF, Word (.docx/.doc), ODT, RTF  
-**Presentations:** PowerPoint (.pptx/.ppt)  
-**Spreadsheets:** Excel (.xlsx/.xls/.xlsm), ODS, CSV, TSV  
-**Text & Code:** TXT, MD, Python, JS, TS, HTML, CSS, Java, C/C++, C#, Go, Rust, Ruby, PHP, Swift  
+**Documents:** PDF, Word, ODT, RTF  
+**Presentations:** PowerPoint  
+**Spreadsheets:** Excel, ODS, CSV, TSV  
+**Code & Text:** Python, JS, TS, HTML, CSS, Java, C/C++, Go, Rust, Ruby, PHP, Swift, MD, TXT  
 **Data:** JSON, JSONL, XML, YAML, TOML, INI, LOG  
 **Notebooks:** Jupyter (.ipynb)
 """)
 
-# -----------------------------
-# SESSION STATE INIT
-# -----------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
 
-# -----------------------------
-# INPUT MODE SELECTION
-# -----------------------------
+# ================================================================
+# HELPER — persist a new message pair into current session
+# ================================================================
+def persist_message(role: str, content: str):
+    """Append a message to the in-memory session and save to disk."""
+    msg = {"role": role, "content": content}
+    st.session_state.messages.append(msg)
+    if st.session_state.current_session is not None:
+        st.session_state.current_session["messages"].append(msg)
+        save_session(st.session_state.current_session)
+
+
+# ================================================================
+# MAIN AREA
+# ================================================================
+st.title("🎓 StudyMate AI")
+st.markdown("### Your Personalized AI Study Companion")
+
+# Auto-create a session if none exists
+if st.session_state.current_session is None:
+    sess = new_session()
+    save_session(sess)
+    st.session_state.current_session = sess
+
+# Show active session name
+st.caption(f"📝 Session: **{st.session_state.current_session['name']}**")
+
 st.markdown("---")
 input_mode = st.radio(
     "📚 How would you like to study today?",
     ["📁 Upload a File", "🖼️ Upload Image", "📷 Take a Photo", "✏️ Enter a Topic"],
     horizontal=True
 )
+
+# Update session's input_mode on change
+if st.session_state.current_session.get("input_mode") != input_mode:
+    st.session_state.current_session["input_mode"] = input_mode
+    save_session(st.session_state.current_session)
+
 
 # ==============================
 # MODE 1: Universal File Upload
@@ -331,27 +509,25 @@ if input_mode == "📁 Upload a File":
                     st.stop()
 
                 vectorstore = build_vectorstore(raw_text, uploaded_file.name)
-
                 st.session_state.vectorstore = vectorstore
                 st.session_state.file_key = file_key
-                st.session_state.messages = []
-                st.session_state.chat_history = []
-                st.session_state.pop("image_data", None)
-                st.session_state.pop("free_topic", None)
+                # Save source name to session
+                st.session_state.current_session["topic"] = uploaded_file.name
+                save_session(st.session_state.current_session)
 
             word_count = len(raw_text.split())
             st.success(f"✅ {file_label} ready! (~{word_count:,} words extracted). Ask your first question below.")
 
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
+    if uploaded_file:
         user_query = st.chat_input("❓ Ask a question about your file...")
-
         if user_query:
-            st.session_state.messages.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
                 st.markdown(user_query)
+            persist_message("user", user_query)
 
             llm = ChatGroq(model=model_choice, temperature=temperature, api_key=groq_api_key)
             retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
@@ -361,12 +537,12 @@ if input_mode == "📁 Upload a File":
                     response = run_rag_chat(user_query, retriever, llm, PERSONAS[mode])
                 st.markdown(response)
 
-            st.session_state.messages.append({"role": "assistant", "content": response})
+            persist_message("assistant", response)
             st.session_state.chat_history.append(HumanMessage(content=user_query))
             st.session_state.chat_history.append(AIMessage(content=response))
+    elif not st.session_state.messages:
+        st.info("📁 Upload any file to get started. See **Supported File Types** in the sidebar.")
 
-    else:
-        st.info("📁 Upload any file to get started. See **Supported File Types** in the sidebar for the full list.")
 
 # ==============================
 # MODE 2 & 3: Image / Camera
@@ -377,7 +553,7 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
 
     if input_mode == "🖼️ Upload Image":
         uploaded_img = st.file_uploader(
-            "Upload an image (photo of notes, diagrams, textbook pages, etc.)",
+            "Upload an image (notes, diagrams, textbook pages, etc.)",
             type=["jpg", "jpeg", "png", "webp"],
             label_visibility="collapsed"
         )
@@ -397,32 +573,28 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
             st.session_state.image_data = base64.standard_b64encode(image_data).decode("utf-8")
             st.session_state.image_media_type = media_type
             st.session_state.image_hash = img_hash
-            st.session_state.messages = []
-            st.session_state.chat_history = []
-            st.session_state.pop("vectorstore", None)
-            st.session_state.pop("free_topic", None)
+            st.session_state.current_session["topic"] = "Image upload"
+            save_session(st.session_state.current_session)
             st.success("✅ Image ready! Ask anything about what's in the image.")
 
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
+    if st.session_state.get("image_data"):
         user_query = st.chat_input("❓ Ask a question about the image...")
-
         if user_query:
-            st.session_state.messages.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
                 st.markdown(user_query)
+            persist_message("user", user_query)
 
             system_prompt = (
                 f"{PERSONAS[mode]}\n\n"
                 "The student has shared an image. Analyze it thoroughly and answer questions about it. "
-                "Use the visual content (text, diagrams, equations, labels, etc.) as your primary reference. "
-                "If something is unclear in the image, say so honestly."
+                "Use the visual content (text, diagrams, equations, labels, etc.) as your primary reference."
             )
 
             history_messages = st.session_state.chat_history.copy()
-
             if not history_messages:
                 first_content = [
                     {"type": "image_url", "image_url": {
@@ -454,15 +626,15 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
                     response = completion.choices[0].message.content
                 st.markdown(response)
 
-            st.session_state.messages.append({"role": "assistant", "content": response})
+            persist_message("assistant", response)
             st.session_state.chat_history.append(HumanMessage(content=user_query))
             st.session_state.chat_history.append(AIMessage(content=response))
-
-    else:
+    elif not st.session_state.messages:
         if input_mode == "🖼️ Upload Image":
-            st.info("🖼️ Upload an image of your notes, a diagram, a textbook page — anything you want to study!")
+            st.info("🖼️ Upload an image of your notes, a diagram, or a textbook page to get started.")
         else:
             st.info("📷 Use the camera above to capture anything you want to learn about.")
+
 
 # ==============================
 # MODE 4: Free Topic
@@ -474,8 +646,8 @@ elif input_mode == "✏️ Enter a Topic":
     with col1:
         topic_input = st.text_input(
             "Enter any topic, concept, or question:",
-            placeholder="e.g. Photosynthesis, The French Revolution, Newton's Laws, Python decorators...",
-            label_visibility="collapsed"
+            placeholder="e.g. Photosynthesis, The French Revolution, Python decorators...",
+            label_visibility="collapsed",
         )
     with col2:
         set_topic = st.button("🚀 Start Studying", use_container_width=True)
@@ -484,13 +656,17 @@ elif input_mode == "✏️ Enter a Topic":
         st.session_state.free_topic = topic_input.strip()
         st.session_state.messages = []
         st.session_state.chat_history = []
-        st.session_state.pop("vectorstore", None)
-        st.session_state.pop("image_data", None)
+        st.session_state.current_session["topic"] = topic_input.strip()
+        st.session_state.current_session["name"] = topic_input.strip()[:50]
+        st.session_state.current_session["messages"] = []
+        save_session(st.session_state.current_session)
+        for k in ["vectorstore", "file_key", "image_data"]:
+            st.session_state.pop(k, None)
         st.rerun()
 
-    current_topic = st.session_state.get("free_topic")
+    current_topic = st.session_state.get("free_topic") or st.session_state.current_session.get("topic", "")
 
-    if current_topic:
+    if current_topic and current_topic != "Image upload":
         st.success(f"📖 Currently studying: **{current_topic}**")
 
         for message in st.session_state.messages:
@@ -503,13 +679,7 @@ elif input_mode == "✏️ Enter a Topic":
         )
 
         if user_query:
-            if user_query != default_prompt:
-                st.session_state.messages.append({"role": "user", "content": user_query})
-                with st.chat_message("user"):
-                    st.markdown(user_query)
-
             llm = ChatGroq(model=model_choice, temperature=temperature, api_key=groq_api_key)
-
             prompt = ChatPromptTemplate.from_messages([
                 ("system", f"""{PERSONAS[mode]}
 
@@ -520,8 +690,12 @@ If the student asks something off-topic, gently guide them back to {current_topi
                 MessagesPlaceholder(variable_name="chat_history"),
                 ("human", "{question}")
             ])
-
             chain = prompt | llm | StrOutputParser()
+
+            if user_query != default_prompt:
+                with st.chat_message("user"):
+                    st.markdown(user_query)
+                persist_message("user", user_query)
 
             with st.chat_message("assistant"):
                 with st.spinner("🧠 Thinking..."):
@@ -532,12 +706,10 @@ If the student asks something off-topic, gently guide them back to {current_topi
                 st.markdown(response)
 
             if user_query == default_prompt:
-                st.session_state.messages.append({"role": "user", "content": user_query})
-
-            st.session_state.messages.append({"role": "assistant", "content": response})
+                persist_message("user", user_query)
+            persist_message("assistant", response)
             st.session_state.chat_history.append(HumanMessage(content=user_query))
             st.session_state.chat_history.append(AIMessage(content=response))
             st.rerun()
-
     else:
         st.info("✏️ Type a topic above and click **Start Studying** to begin — no files needed!")
