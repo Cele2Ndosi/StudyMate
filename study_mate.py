@@ -1,6 +1,12 @@
 import streamlit as st
 import io
 import base64
+import os
+import json
+import warnings
+import pypdf
+import pandas as pd
+
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
@@ -9,8 +15,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import warnings
-import pypdf
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="StudyMate AI", page_icon="🎓", layout="wide")
@@ -39,7 +44,212 @@ PERSONAS = {
         "You ask clear, concise questions based on previous topics, provide immediate, constructive feedback on answers, and keep score if requested. "
         "You tailor the difficulty level to the student's progress and explain why an answer is correct or incorrect to deepen understanding."
     ),
+    "ELI5 Simplifier": (
+        "You are an expert at explaining complex topics in the simplest way possible — as if explaining to a curious 10-year-old. "
+        "Use everyday analogies, short sentences, and familiar examples. Avoid jargon entirely; if a technical term is unavoidable, immediately explain it in plain language. "
+        "Break everything down into small, digestible pieces. Use comparisons to things from daily life (food, games, sports, toys) to make abstract ideas concrete. "
+        "Keep a warm, encouraging, and enthusiastic tone — learning should feel easy and fun, never overwhelming. "
+        "If the student seems confused, try a completely different analogy. Never say 'it's complicated' — everything can be made simple."
+    ),
 }
+
+# -----------------------------
+# SUPPORTED FILE TYPES
+# -----------------------------
+SUPPORTED_EXTENSIONS = [
+    # Documents
+    "pdf", "docx", "doc", "odt", "rtf",
+    # Presentations
+    "pptx", "ppt",
+    # Spreadsheets
+    "xlsx", "xls", "xlsm", "ods", "csv", "tsv",
+    # Text / Code / Data
+    "txt", "md", "py", "js", "ts", "html", "css", "java",
+    "c", "cpp", "cs", "go", "rs", "rb", "php", "swift",
+    "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "log",
+    # Notebooks
+    "ipynb",
+]
+
+FILE_TYPE_LABELS = {
+    "pdf": "📄 PDF", "docx": "📝 Word", "doc": "📝 Word (legacy)",
+    "odt": "📝 OpenDocument Text", "rtf": "📝 Rich Text",
+    "pptx": "📊 PowerPoint", "ppt": "📊 PowerPoint (legacy)",
+    "xlsx": "📈 Excel", "xls": "📈 Excel (legacy)",
+    "xlsm": "📈 Excel (macro)", "ods": "📈 OpenDocument Sheet",
+    "csv": "📋 CSV", "tsv": "📋 TSV",
+    "txt": "📃 Text", "md": "📃 Markdown", "ipynb": "📓 Jupyter Notebook",
+    "json": "🔧 JSON", "jsonl": "🔧 JSONL", "xml": "🔧 XML",
+    "yaml": "🔧 YAML", "yml": "🔧 YAML", "toml": "🔧 TOML",
+    "ini": "🔧 Config", "log": "📋 Log",
+    "py": "🐍 Python", "js": "⚡ JavaScript", "ts": "⚡ TypeScript",
+    "html": "🌐 HTML", "css": "🎨 CSS", "java": "☕ Java",
+    "c": "⚙️ C", "cpp": "⚙️ C++", "cs": "⚙️ C#",
+    "go": "🐹 Go", "rs": "🦀 Rust", "rb": "💎 Ruby",
+    "php": "🐘 PHP", "swift": "🍎 Swift",
+}
+
+
+# -----------------------------------------------
+# TEXT EXTRACTION — handles all supported formats
+# -----------------------------------------------
+def extract_text_from_file(uploaded_file) -> str:
+    """Extract plain text from any supported file type."""
+    filename = uploaded_file.name
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    raw = uploaded_file.read()
+    buf = io.BytesIO(raw)
+
+    # PDF
+    if ext == "pdf":
+        reader = pypdf.PdfReader(buf)
+        pages = []
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text and text.strip():
+                pages.append(f"[Page {i+1}]\n{text.strip()}")
+        if not pages:
+            raise ValueError("Could not extract text from this PDF. It may be scanned or image-based.")
+        return "\n\n".join(pages)
+
+    # Word / ODT / RTF / EPUB — try docx2txt then pandoc fallback
+    elif ext in ("docx", "odt", "rtf", "epub"):
+        tmp = f"/tmp/_studymate_upload.{ext}"
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        try:
+            import docx2txt
+            text = docx2txt.process(tmp)
+            if text and text.strip():
+                return text.strip()
+        except Exception:
+            pass
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["pandoc", tmp, "-t", "plain"],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+        raise ValueError(f"Could not extract text from {ext.upper()} file. Try converting to PDF or TXT first.")
+
+    # PowerPoint
+    elif ext in ("pptx", "ppt"):
+        try:
+            from pptx import Presentation
+            prs = Presentation(buf)
+            slides = []
+            for i, slide in enumerate(prs.slides):
+                texts = [
+                    shape.text.strip()
+                    for shape in slide.shapes
+                    if hasattr(shape, "text") and shape.text.strip()
+                ]
+                if texts:
+                    slides.append(f"[Slide {i+1}]\n" + "\n".join(texts))
+            if not slides:
+                raise ValueError("No text found in presentation.")
+            return "\n\n".join(slides)
+        except ImportError:
+            raise ValueError("python-pptx is required. Run: pip install python-pptx")
+
+    # Excel / ODS
+    elif ext in ("xlsx", "xlsm"):
+        df_dict = pd.read_excel(buf, sheet_name=None, engine="openpyxl")
+        return "\n\n".join(f"[Sheet: {name}]\n{df.to_string(index=False)}" for name, df in df_dict.items())
+
+    elif ext == "ods":
+        df_dict = pd.read_excel(buf, sheet_name=None, engine="odf")
+        return "\n\n".join(f"[Sheet: {name}]\n{df.to_string(index=False)}" for name, df in df_dict.items())
+
+    elif ext == "xls":
+        df_dict = pd.read_excel(buf, sheet_name=None, engine="xlrd")
+        return "\n\n".join(f"[Sheet: {name}]\n{df.to_string(index=False)}" for name, df in df_dict.items())
+
+    # CSV / TSV
+    elif ext in ("csv", "tsv"):
+        sep = "\t" if ext == "tsv" else ","
+        df = pd.read_csv(buf, sep=sep)
+        return df.to_string(index=False)
+
+    # JSON
+    elif ext == "json":
+        data = json.load(buf)
+        return json.dumps(data, indent=2)
+
+    # JSONL
+    elif ext == "jsonl":
+        lines = raw.decode("utf-8", errors="replace").strip().split("\n")
+        parsed = []
+        for line in lines[:500]:
+            try:
+                parsed.append(json.dumps(json.loads(line)))
+            except Exception:
+                parsed.append(line)
+        return "\n".join(parsed)
+
+    # Jupyter Notebook
+    elif ext == "ipynb":
+        nb = json.loads(raw.decode("utf-8", errors="replace"))
+        cells = []
+        for cell in nb.get("cells", []):
+            ct = cell.get("cell_type", "")
+            src = "".join(cell.get("source", []))
+            if src.strip():
+                label = "# CODE CELL" if ct == "code" else "# MARKDOWN"
+                cells.append(f"{label}\n{src.strip()}")
+        return "\n\n".join(cells)
+
+    # Plain text, code, config, markup
+    elif ext in (
+        "txt", "md", "py", "js", "ts", "html", "css", "java",
+        "c", "cpp", "cs", "go", "rs", "rb", "php", "swift",
+        "xml", "yaml", "yml", "toml", "ini", "log",
+    ):
+        return raw.decode("utf-8", errors="replace")
+
+    else:
+        # Last-ditch UTF-8 decode
+        decoded = raw.decode("utf-8", errors="replace")
+        if decoded.strip():
+            return decoded
+        raise ValueError(f"Unsupported or unreadable file type: .{ext}")
+
+
+def build_vectorstore(text: str, source_name: str):
+    """Chunk text and build a FAISS vectorstore."""
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+    docs = text_splitter.create_documents([text], metadatas=[{"source": source_name}])
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return FAISS.from_documents(docs, embeddings)
+
+
+def run_rag_chat(user_query: str, retriever, llm, persona: str) -> str:
+    """Retrieve relevant chunks and run the LLM chain."""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", f"""{persona}
+
+You have access to the following document context to answer questions.
+Always use this context to ground your answers.
+If the answer is not in the context, say "The answer is not found in the document."
+
+Document Context:
+{{context}}"""),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}")
+    ])
+    retrieved_docs = retriever.invoke(user_query)
+    context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({
+        "context": context,
+        "chat_history": st.session_state.chat_history,
+        "question": user_query
+    })
+
 
 # -----------------------------
 # SIDEBAR SETTINGS
@@ -55,17 +265,25 @@ model_choice = st.sidebar.selectbox("Choose Model:", [
 ])
 
 if st.sidebar.button("🗑️ Clear Chat History"):
+    for key in ["messages", "chat_history", "vectorstore", "file_key",
+                "image_data", "image_media_type", "image_hash", "free_topic"]:
+        st.session_state.pop(key, None)
     st.session_state.messages = []
     st.session_state.chat_history = []
-    st.session_state.pop("vectorstore", None)
-    st.session_state.pop("file_key", None)
-    st.session_state.pop("image_data", None)
-    st.session_state.pop("image_media_type", None)
-    st.session_state.pop("free_topic", None)
     st.rerun()
 
+with st.sidebar.expander("📂 Supported File Types"):
+    st.markdown("""
+**Documents:** PDF, Word (.docx/.doc), ODT, RTF  
+**Presentations:** PowerPoint (.pptx/.ppt)  
+**Spreadsheets:** Excel (.xlsx/.xls/.xlsm), ODS, CSV, TSV  
+**Text & Code:** TXT, MD, Python, JS, TS, HTML, CSS, Java, C/C++, C#, Go, Rust, Ruby, PHP, Swift  
+**Data:** JSON, JSONL, XML, YAML, TOML, INI, LOG  
+**Notebooks:** Jupyter (.ipynb)
+""")
+
 # -----------------------------
-# INITIALIZE SESSION STATE
+# SESSION STATE INIT
 # -----------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -78,42 +296,41 @@ if "chat_history" not in st.session_state:
 st.markdown("---")
 input_mode = st.radio(
     "📚 How would you like to study today?",
-    ["📄 Upload PDF", "🖼️ Upload Image", "📷 Take a Photo", "✏️ Enter a Topic"],
+    ["📁 Upload a File", "🖼️ Upload Image", "📷 Take a Photo", "✏️ Enter a Topic"],
     horizontal=True
 )
 
 # ==============================
-# MODE 1: PDF Upload
+# MODE 1: Universal File Upload
 # ==============================
-if input_mode == "📄 Upload PDF":
-    uploaded_file = st.file_uploader("Upload your study PDF", type="pdf", label_visibility="collapsed")
+if input_mode == "📁 Upload a File":
+    uploaded_file = st.file_uploader(
+        "Upload any document, spreadsheet, code file, or data file",
+        type=SUPPORTED_EXTENSIONS,
+        label_visibility="collapsed",
+    )
 
     if uploaded_file:
-        file_key = uploaded_file.name
+        ext = uploaded_file.name.rsplit(".", 1)[-1].lower() if "." in uploaded_file.name else "?"
+        file_label = FILE_TYPE_LABELS.get(ext, f"📄 .{ext.upper()}")
+        file_key = f"{uploaded_file.name}_{uploaded_file.size}"
 
         if "vectorstore" not in st.session_state or st.session_state.get("file_key") != file_key:
-            with st.spinner("🔄 Processing your document..."):
-                pdf_bytes = uploaded_file.read()
-                pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-
-                pages = []
-                for i, page in enumerate(pdf_reader.pages):
-                    text = page.extract_text()
-                    if text and text.strip():
-                        pages.append(Document(
-                            page_content=text,
-                            metadata={"page": i + 1, "source": uploaded_file.name}
-                        ))
-
-                if not pages:
-                    st.error("❌ Could not extract text from this PDF. It may be scanned or image-based.")
+            with st.spinner(f"🔄 Processing your {file_label} file..."):
+                try:
+                    raw_text = extract_text_from_file(uploaded_file)
+                except ValueError as e:
+                    st.error(f"❌ {e}")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"❌ Unexpected error reading file: {e}")
                     st.stop()
 
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
-                docs = text_splitter.split_documents(pages)
+                if not raw_text or not raw_text.strip():
+                    st.error("❌ No readable text could be extracted from this file.")
+                    st.stop()
 
-                embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-                vectorstore = FAISS.from_documents(docs, embeddings)
+                vectorstore = build_vectorstore(raw_text, uploaded_file.name)
 
                 st.session_state.vectorstore = vectorstore
                 st.session_state.file_key = file_key
@@ -122,14 +339,14 @@ if input_mode == "📄 Upload PDF":
                 st.session_state.pop("image_data", None)
                 st.session_state.pop("free_topic", None)
 
-            st.success("✅ Document ready! Ask your first question below.")
+            word_count = len(raw_text.split())
+            st.success(f"✅ {file_label} ready! (~{word_count:,} words extracted). Ask your first question below.")
 
-        # Display chat history
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        user_query = st.chat_input("❓ Ask a question about your document...")
+        user_query = st.chat_input("❓ Ask a question about your file...")
 
         if user_query:
             st.session_state.messages.append({"role": "user", "content": user_query})
@@ -139,40 +356,20 @@ if input_mode == "📄 Upload PDF":
             llm = ChatGroq(model=model_choice, temperature=temperature, api_key=groq_api_key)
             retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
 
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", f"""{PERSONAS[mode]}
-
-You have access to the following document context to answer questions.
-Always use this context to ground your answers.
-If the answer is not in the context, say "The answer is not found in the document."
-
-Document Context:
-{{context}}"""),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{question}")
-            ])
-
-            retrieved_docs = retriever.invoke(user_query)
-            context = "\n\n".join(doc.page_content for doc in retrieved_docs)
-            chain = prompt | llm | StrOutputParser()
-
             with st.chat_message("assistant"):
                 with st.spinner("🧠 Thinking..."):
-                    response = chain.invoke({
-                        "context": context,
-                        "chat_history": st.session_state.chat_history,
-                        "question": user_query
-                    })
+                    response = run_rag_chat(user_query, retriever, llm, PERSONAS[mode])
                 st.markdown(response)
 
             st.session_state.messages.append({"role": "assistant", "content": response})
             st.session_state.chat_history.append(HumanMessage(content=user_query))
             st.session_state.chat_history.append(AIMessage(content=response))
+
     else:
-        st.info("📄 Please upload a PDF to get started.")
+        st.info("📁 Upload any file to get started. See **Supported File Types** in the sidebar for the full list.")
 
 # ==============================
-# MODE 2 & 3: Image Upload / Camera
+# MODE 2 & 3: Image / Camera
 # ==============================
 elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
     image_data = None
@@ -188,15 +385,13 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
             image_data = uploaded_img.read()
             media_type = uploaded_img.type or "image/jpeg"
             st.image(image_data, caption="Uploaded Image", use_container_width=True)
-
-    else:  # Camera
+    else:
         camera_image = st.camera_input("📷 Point your camera at anything you want to learn about!")
         if camera_image:
             image_data = camera_image.read()
             media_type = "image/jpeg"
 
     if image_data:
-        # Store image in session if new
         img_hash = hash(image_data)
         if st.session_state.get("image_hash") != img_hash:
             st.session_state.image_data = base64.standard_b64encode(image_data).decode("utf-8")
@@ -208,7 +403,6 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
             st.session_state.pop("free_topic", None)
             st.success("✅ Image ready! Ask anything about what's in the image.")
 
-        # Display chat history
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
@@ -220,10 +414,6 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
             with st.chat_message("user"):
                 st.markdown(user_query)
 
-            # Build multimodal message history
-            # For the first turn, attach the image. For subsequent turns, rely on chat history text.
-            llm = ChatGroq(model=model_choice, temperature=temperature, api_key=groq_api_key)
-
             system_prompt = (
                 f"{PERSONAS[mode]}\n\n"
                 "The student has shared an image. Analyze it thoroughly and answer questions about it. "
@@ -231,18 +421,13 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
                 "If something is unclear in the image, say so honestly."
             )
 
-            # Construct messages manually for vision support
             history_messages = st.session_state.chat_history.copy()
 
-            # First message includes the image
             if not history_messages:
                 first_content = [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{st.session_state.image_media_type};base64,{st.session_state.image_data}"
-                        }
-                    },
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:{st.session_state.image_media_type};base64,{st.session_state.image_data}"
+                    }},
                     {"type": "text", "text": user_query}
                 ]
                 messages_to_send = [
@@ -250,13 +435,10 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
                     {"role": "user", "content": first_content}
                 ]
             else:
-                # Subsequent messages: include image in system context reminder + new question
                 messages_to_send = [{"role": "system", "content": system_prompt}]
                 for msg in history_messages:
-                    if isinstance(msg, HumanMessage):
-                        messages_to_send.append({"role": "user", "content": msg.content})
-                    elif isinstance(msg, AIMessage):
-                        messages_to_send.append({"role": "assistant", "content": msg.content})
+                    role = "user" if isinstance(msg, HumanMessage) else "assistant"
+                    messages_to_send.append({"role": role, "content": msg.content})
                 messages_to_send.append({"role": "user", "content": user_query})
 
             with st.chat_message("assistant"):
@@ -264,7 +446,7 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
                     from groq import Groq
                     client = Groq(api_key=groq_api_key)
                     completion = client.chat.completions.create(
-                        model="meta-llama/llama-4-scout-17b-16e-instruct",  # vision-capable model
+                        model="meta-llama/llama-4-scout-17b-16e-instruct",
                         messages=messages_to_send,
                         temperature=temperature,
                         max_tokens=1024,
@@ -283,7 +465,7 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
             st.info("📷 Use the camera above to capture anything you want to learn about.")
 
 # ==============================
-# MODE 4: Free Topic (No File)
+# MODE 4: Free Topic
 # ==============================
 elif input_mode == "✏️ Enter a Topic":
     st.markdown("#### 💡 What do you want to learn about today?")
@@ -311,7 +493,6 @@ elif input_mode == "✏️ Enter a Topic":
     if current_topic:
         st.success(f"📖 Currently studying: **{current_topic}**")
 
-        # Display chat history
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
@@ -334,7 +515,7 @@ elif input_mode == "✏️ Enter a Topic":
 
 The student wants to learn about: {current_topic}
 
-Use your broad knowledge to teach this topic thoroughly. 
+Use your broad knowledge to teach this topic thoroughly.
 If the student asks something off-topic, gently guide them back to {current_topic} unless it's a natural extension."""),
                 MessagesPlaceholder(variable_name="chat_history"),
                 ("human", "{question}")
@@ -350,14 +531,11 @@ If the student asks something off-topic, gently guide them back to {current_topi
                     })
                 st.markdown(response)
 
-            if user_query != default_prompt:
-                st.session_state.chat_history.append(HumanMessage(content=user_query))
-            else:
+            if user_query == default_prompt:
                 st.session_state.messages.append({"role": "user", "content": user_query})
-                with st.chat_message("user"):
-                    st.markdown(user_query)
 
             st.session_state.messages.append({"role": "assistant", "content": response})
+            st.session_state.chat_history.append(HumanMessage(content=user_query))
             st.session_state.chat_history.append(AIMessage(content=response))
             st.rerun()
 
