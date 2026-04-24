@@ -14,7 +14,6 @@ from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -24,12 +23,17 @@ st.set_page_config(page_title="StudyMate AI", page_icon="🎓", layout="wide")
 
 # ================================================================
 # PERSISTENCE LAYER
-# Sessions are stored as JSON files in ./sessions/
-# Each session = { id, name, created_at, updated_at,
-#                  input_mode, topic, messages: [{role, content}] }
+# Sessions stored as JSON in ./sessions/
+# Schema: { id, name, created_at, updated_at,
+#           input_mode, topic, messages: [{role, content}] }
+#
+# Save policy: sessions are written to disk only when there is
+# content worth keeping — not on every rerun or UI interaction.
 # ================================================================
 SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+MAX_CHAT_HISTORY = 20  # max LangChain message objects kept in memory
 
 
 def _session_path(session_id: str) -> str:
@@ -49,15 +53,14 @@ def list_sessions() -> list[dict]:
     return sorted(sessions, key=lambda s: s.get("updated_at", ""), reverse=True)
 
 
-def save_session(session: dict):
-    """Write a session dict to disk."""
+def save_session(session: dict) -> None:
+    """Write a session dict to disk, updating updated_at."""
     session["updated_at"] = datetime.datetime.now().isoformat()
     with open(_session_path(session["id"]), "w") as f:
         json.dump(session, f, indent=2)
 
 
 def load_session(session_id: str) -> dict | None:
-    """Load a session from disk by id."""
     path = _session_path(session_id)
     if os.path.exists(path):
         with open(path, "r") as f:
@@ -65,28 +68,27 @@ def load_session(session_id: str) -> dict | None:
     return None
 
 
-def delete_session(session_id: str):
-    """Delete a session file from disk."""
+def delete_session(session_id: str) -> None:
     path = _session_path(session_id)
     if os.path.exists(path):
         os.remove(path)
 
 
 def new_session(name: str = "", input_mode: str = "", topic: str = "") -> dict:
-    """Create a fresh session dict (not yet saved)."""
+    """Create a fresh session dict. Not saved to disk until persist_message() is called."""
+    now = datetime.datetime.now().isoformat()
     return {
         "id": str(uuid.uuid4()),
         "name": name or f"Session {datetime.datetime.now().strftime('%b %d, %H:%M')}",
-        "created_at": datetime.datetime.now().isoformat(),
-        "updated_at": datetime.datetime.now().isoformat(),
+        "created_at": now,
+        "updated_at": now,
         "input_mode": input_mode,
         "topic": topic,
-        "messages": [],   # [{role, content}]
+        "messages": [],
     }
 
 
 def export_session_as_txt(session: dict) -> str:
-    """Render a session's chat history as plain text for download."""
     lines = [
         f"StudyMate AI — {session['name']}",
         f"Created: {session['created_at'][:16].replace('T', ' ')}",
@@ -286,7 +288,7 @@ Document Context:
     return chain.invoke({
         "context": context,
         "chat_history": st.session_state.chat_history,
-        "question": user_query
+        "question": user_query,
     })
 
 
@@ -303,13 +305,63 @@ def lc_history_from_messages(messages: list[dict]) -> list:
 
 # ================================================================
 # SESSION STATE BOOTSTRAP
+# current_session: dict | None  — None means "not started yet"
+# messages:        list[dict]   — independent copy, never shared ref
+# chat_history:    list[LC msg] — trimmed to MAX_CHAT_HISTORY pairs
 # ================================================================
 if "current_session" not in st.session_state:
-    st.session_state.current_session = None   # dict or None
+    st.session_state.current_session = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
+
+def _ensure_session() -> None:
+    """Lazily create a session the first time content is about to be saved.
+    This prevents ghost sessions for users who open the app but never chat."""
+    if st.session_state.current_session is None:
+        sess = new_session()
+        st.session_state.current_session = sess
+        # Don't save yet — persist_message() will save on first message.
+
+
+def persist_message(role: str, content: str) -> None:
+    """Append a message to both in-memory lists and save the session to disk.
+
+    Save policy:
+    - Ensures a session exists (lazy creation).
+    - Saves to disk once per message — not on every UI interaction.
+    - Uses a fresh copy of messages so session dict and st.session_state.messages
+      are always independent objects (no shared-reference mutations).
+    """
+    _ensure_session()
+
+    msg = {"role": role, "content": content}
+
+    # Keep UI list and session list as separate objects — no shared references.
+    st.session_state.messages.append(msg)
+    st.session_state.current_session["messages"] = list(st.session_state.messages)
+
+    # Trim LangChain history to avoid unbounded token growth.
+    st.session_state.chat_history = st.session_state.chat_history[-MAX_CHAT_HISTORY:]
+
+    save_session(st.session_state.current_session)
+
+
+def _load_session_into_state(sess: dict) -> None:
+    """Switch the active session. Uses list() to guarantee independent copies."""
+    st.session_state.current_session = dict(sess)  # top-level copy
+    st.session_state.messages = list(sess.get("messages", []))  # independent list
+    st.session_state.chat_history = lc_history_from_messages(st.session_state.messages)[-MAX_CHAT_HISTORY:]
+    # Clear stale file / image state — user must re-upload
+    for k in ["vectorstore", "file_key", "image_data", "image_media_type", "image_hash"]:
+        st.session_state.pop(k, None)
+    # Only restore free_topic when the session was actually in topic mode
+    if sess.get("input_mode") == "✏️ Enter a Topic":
+        st.session_state.free_topic = sess.get("topic", "")
+    else:
+        st.session_state.pop("free_topic", None)
 
 
 # ================================================================
@@ -325,7 +377,7 @@ model_choice = st.sidebar.selectbox("Model:", [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "gemma2-9b-it",
-    "deepseek-r1-distill-llama-70b"
+    "deepseek-r1-distill-llama-70b",
 ])
 
 st.sidebar.markdown("---")
@@ -336,9 +388,8 @@ st.sidebar.header("💾 Sessions")
 col_new, col_clear = st.sidebar.columns(2)
 with col_new:
     if st.button("＋ New", use_container_width=True, help="Start a brand-new session"):
-        sess = new_session()
-        save_session(sess)
-        st.session_state.current_session = sess
+        # Reset to a blank slate. A new session dict is created lazily on first message.
+        st.session_state.current_session = None
         st.session_state.messages = []
         st.session_state.chat_history = []
         for k in ["vectorstore", "file_key", "image_data", "image_media_type", "image_hash", "free_topic"]:
@@ -364,8 +415,10 @@ if st.session_state.current_session:
             label_visibility="collapsed",
         )
         if st.button("Save name", key="save_name"):
-            st.session_state.current_session["name"] = new_name.strip() or st.session_state.current_session["name"]
-            save_session(st.session_state.current_session)
+            trimmed = new_name.strip()
+            if trimmed:
+                st.session_state.current_session["name"] = trimmed
+                save_session(st.session_state.current_session)
             st.rerun()
 
 # ── Download current session ──────────────────────────────────
@@ -401,22 +454,15 @@ else:
         with st.sidebar.container():
             col_btn, col_del = st.sidebar.columns([4, 1])
             with col_btn:
-                btn_label = f"**{label}**\n{updated} · {msg_count} msgs" if is_active else f"{label}\n{updated} · {msg_count} msgs"
                 if st.button(
                     label,
                     key=f"load_{sess['id']}",
                     use_container_width=True,
                     type="primary" if is_active else "secondary",
+                    help=f"{updated} · {msg_count} msgs",
                 ):
                     if not is_active:
-                        # Load this session into active state
-                        st.session_state.current_session = sess
-                        st.session_state.messages = sess.get("messages", [])
-                        st.session_state.chat_history = lc_history_from_messages(sess.get("messages", []))
-                        # Clear stale file/image state — user must re-upload
-                        for k in ["vectorstore", "file_key", "image_data", "image_media_type", "image_hash"]:
-                            st.session_state.pop(k, None)
-                        st.session_state.free_topic = sess.get("topic", "")
+                        _load_session_into_state(sess)
                         st.rerun()
             with col_del:
                 if st.button("🗑", key=f"del_{sess['id']}", help="Delete this session"):
@@ -439,41 +485,30 @@ with st.sidebar.expander("📂 Supported File Types"):
 
 
 # ================================================================
-# HELPER — persist a new message pair into current session
-# ================================================================
-def persist_message(role: str, content: str):
-    """Append a message to the in-memory session and save to disk."""
-    msg = {"role": role, "content": content}
-    st.session_state.messages.append(msg)
-    if st.session_state.current_session is not None:
-        st.session_state.current_session["messages"].append(msg)
-        save_session(st.session_state.current_session)
-
-
-# ================================================================
 # MAIN AREA
 # ================================================================
 st.title("🎓 StudyMate AI")
 st.markdown("### Your Personalized AI Study Companion")
 
-# Auto-create a session if none exists
-if st.session_state.current_session is None:
-    sess = new_session()
-    save_session(sess)
-    st.session_state.current_session = sess
-
-# Show active session name
-st.caption(f"📝 Session: **{st.session_state.current_session['name']}**")
+# Session label — shows "New session" until first message is saved
+if st.session_state.current_session:
+    st.caption(f"📝 Session: **{st.session_state.current_session['name']}**")
+else:
+    st.caption("📝 New session — start chatting to save it automatically.")
 
 st.markdown("---")
 input_mode = st.radio(
     "📚 How would you like to study today?",
     ["📁 Upload a File", "🖼️ Upload Image", "📷 Take a Photo", "✏️ Enter a Topic"],
-    horizontal=True
+    horizontal=True,
 )
 
-# Update session's input_mode on change
-if st.session_state.current_session.get("input_mode") != input_mode:
+# Persist input_mode change only when there's an active saved session
+if (
+    st.session_state.current_session is not None
+    and st.session_state.current_session.get("input_mode") != input_mode
+    and st.session_state.current_session.get("messages")  # don't save empty-session metadata churn
+):
     st.session_state.current_session["input_mode"] = input_mode
     save_session(st.session_state.current_session)
 
@@ -511,9 +546,6 @@ if input_mode == "📁 Upload a File":
                 vectorstore = build_vectorstore(raw_text, uploaded_file.name)
                 st.session_state.vectorstore = vectorstore
                 st.session_state.file_key = file_key
-                # Save source name to session
-                st.session_state.current_session["topic"] = uploaded_file.name
-                save_session(st.session_state.current_session)
 
             word_count = len(raw_text.split())
             st.success(f"✅ {file_label} ready! (~{word_count:,} words extracted). Ask your first question below.")
@@ -522,12 +554,17 @@ if input_mode == "📁 Upload a File":
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    if uploaded_file:
+    if uploaded_file and "vectorstore" in st.session_state:
         user_query = st.chat_input("❓ Ask a question about your file...")
         if user_query:
             with st.chat_message("user"):
                 st.markdown(user_query)
             persist_message("user", user_query)
+
+            # Tag the session with the source file (once per file, not every message)
+            if st.session_state.current_session.get("topic") != uploaded_file.name:
+                st.session_state.current_session["topic"] = uploaded_file.name
+                save_session(st.session_state.current_session)
 
             llm = ChatGroq(model=model_choice, temperature=temperature, api_key=groq_api_key)
             retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
@@ -555,7 +592,7 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
         uploaded_img = st.file_uploader(
             "Upload an image (notes, diagrams, textbook pages, etc.)",
             type=["jpg", "jpeg", "png", "webp"],
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
         if uploaded_img:
             image_data = uploaded_img.read()
@@ -573,8 +610,9 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
             st.session_state.image_data = base64.standard_b64encode(image_data).decode("utf-8")
             st.session_state.image_media_type = media_type
             st.session_state.image_hash = img_hash
-            st.session_state.current_session["topic"] = "Image upload"
-            save_session(st.session_state.current_session)
+            # Reset conversation when a new image is loaded
+            st.session_state.messages = []
+            st.session_state.chat_history = []
             st.success("✅ Image ready! Ask anything about what's in the image.")
 
     for message in st.session_state.messages:
@@ -588,30 +626,40 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
                 st.markdown(user_query)
             persist_message("user", user_query)
 
+            # Tag the session with image topic (once)
+            if st.session_state.current_session.get("topic") != "Image upload":
+                st.session_state.current_session["topic"] = "Image upload"
+                save_session(st.session_state.current_session)
+
             system_prompt = (
                 f"{PERSONAS[mode]}\n\n"
                 "The student has shared an image. Analyze it thoroughly and answer questions about it. "
                 "Use the visual content (text, diagrams, equations, labels, etc.) as your primary reference."
             )
 
-            history_messages = st.session_state.chat_history.copy()
-            if not history_messages:
-                first_content = [
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:{st.session_state.image_media_type};base64,{st.session_state.image_data}"
-                    }},
-                    {"type": "text", "text": user_query}
-                ]
-                messages_to_send = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": first_content}
-                ]
-            else:
-                messages_to_send = [{"role": "system", "content": system_prompt}]
-                for msg in history_messages:
-                    role = "user" if isinstance(msg, HumanMessage) else "assistant"
-                    messages_to_send.append({"role": role, "content": msg.content})
-                messages_to_send.append({"role": "user", "content": user_query})
+            # Always include the image as the first user turn so the model retains
+            # visual context across the full conversation, not just on turn 1.
+            image_turn = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{st.session_state.image_media_type};base64,{st.session_state.image_data}"
+                        },
+                    },
+                    {"type": "text", "text": "Please analyse this image. I will ask you questions about it."},
+                ],
+            }
+
+            messages_to_send = [{"role": "system", "content": system_prompt}, image_turn]
+
+            # Replay prior turns (text-only — image is already injected above)
+            for msg in st.session_state.chat_history:
+                role = "user" if isinstance(msg, HumanMessage) else "assistant"
+                messages_to_send.append({"role": role, "content": msg.content})
+
+            messages_to_send.append({"role": "user", "content": user_query})
 
             with st.chat_message("assistant"):
                 with st.spinner("🧠 Analyzing image..."):
@@ -653,26 +701,30 @@ elif input_mode == "✏️ Enter a Topic":
         set_topic = st.button("🚀 Start Studying", use_container_width=True)
 
     if set_topic and topic_input.strip():
-        st.session_state.free_topic = topic_input.strip()
+        topic = topic_input.strip()
+        st.session_state.free_topic = topic
         st.session_state.messages = []
         st.session_state.chat_history = []
-        st.session_state.current_session["topic"] = topic_input.strip()
-        st.session_state.current_session["name"] = topic_input.strip()[:50]
-        st.session_state.current_session["messages"] = []
-        save_session(st.session_state.current_session)
-        for k in ["vectorstore", "file_key", "image_data"]:
+        for k in ["vectorstore", "file_key", "image_data", "image_media_type", "image_hash"]:
             st.session_state.pop(k, None)
+
+        # Start a fresh named session for this topic.
+        # Don't save to disk yet — persist_message() will do that on first message.
+        sess = new_session(name=topic[:50], input_mode=input_mode, topic=topic)
+        st.session_state.current_session = sess
+
         st.rerun()
 
-    current_topic = st.session_state.get("free_topic") or st.session_state.current_session.get("topic", "")
+    current_topic = st.session_state.get("free_topic", "")
 
-    if current_topic and current_topic != "Image upload":
+    if current_topic:
         st.success(f"📖 Currently studying: **{current_topic}**")
 
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
+        # Auto-send a starter prompt only on the very first turn
         default_prompt = f"Let's start! Help me learn about: {current_topic}" if not st.session_state.messages else None
         user_query = st.chat_input("❓ Ask anything about this topic...") or (
             default_prompt if not st.session_state.messages else None
@@ -688,25 +740,25 @@ The student wants to learn about: {current_topic}
 Use your broad knowledge to teach this topic thoroughly.
 If the student asks something off-topic, gently guide them back to {current_topic} unless it's a natural extension."""),
                 MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{question}")
+                ("human", "{question}"),
             ])
             chain = prompt | llm | StrOutputParser()
 
+            # Only show the user bubble for real queries, not the silent auto-starter
             if user_query != default_prompt:
                 with st.chat_message("user"):
                     st.markdown(user_query)
-                persist_message("user", user_query)
 
             with st.chat_message("assistant"):
                 with st.spinner("🧠 Thinking..."):
                     response = chain.invoke({
                         "chat_history": st.session_state.chat_history,
-                        "question": user_query
+                        "question": user_query,
                     })
                 st.markdown(response)
 
-            if user_query == default_prompt:
-                persist_message("user", user_query)
+            # Persist both turns (user first, even for the hidden starter)
+            persist_message("user", user_query)
             persist_message("assistant", response)
             st.session_state.chat_history.append(HumanMessage(content=user_query))
             st.session_state.chat_history.append(AIMessage(content=response))
