@@ -373,9 +373,13 @@ st.sidebar.title("🎓 StudyMate AI")
 st.sidebar.header("⚙️ Settings")
 mode = st.sidebar.radio("Study Mode:", list(PERSONAS.keys()))
 temperature = st.sidebar.slider("Creativity Level", 0.0, 1.0, 0.3)
+# NOTE (Sept 2026): llama-3.3-70b-versatile and llama-3.1-8b-instant were
+# decommissioned by Groq on Aug 16, 2026. Replaced with their recommended
+# successors below. See https://console.groq.com/docs/deprecations
 model_choice = st.sidebar.selectbox("Model:", [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
     "gemma2-9b-it",
     "deepseek-r1-distill-llama-70b",
 ])
@@ -665,8 +669,13 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
                 with st.spinner("🧠 Analyzing image..."):
                     from groq import Groq
                     client = Groq(api_key=groq_api_key)
+                    # NOTE (Sept 2026): meta-llama/llama-4-scout-17b-16e-instruct was
+                    # deprecated by Groq. qwen/qwen3.6-27b is Groq's current
+                    # vision-capable model, but is served as a PREVIEW model there
+                    # (fine for prototyping; re-check before relying on it in prod,
+                    # since preview models can be discontinued at short notice).
                     completion = client.chat.completions.create(
-                        model="meta-llama/llama-4-scout-17b-16e-instruct",
+                        model="qwen/qwen3.6-27b",
                         messages=messages_to_send,
                         temperature=temperature,
                         max_tokens=1024,
