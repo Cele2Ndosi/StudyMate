@@ -303,6 +303,17 @@ def lc_history_from_messages(messages: list[dict]) -> list:
     return history
 
 
+def render_mode_selector(key: str) -> str:
+    """Study Mode picker shown right above the prompt box, so it can be
+    changed per question instead of being locked in for the whole session."""
+    return st.radio(
+        "🎭 Study Mode:",
+        list(PERSONAS.keys()),
+        horizontal=True,
+        key=key,
+    )
+
+
 # ================================================================
 # SESSION STATE BOOTSTRAP
 # current_session: dict | None  — None means "not started yet"
@@ -315,6 +326,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "study_mode" not in st.session_state:
+    st.session_state.study_mode = list(PERSONAS.keys())[0]
 
 
 def _ensure_session() -> None:
@@ -371,7 +384,7 @@ st.sidebar.title("🎓 StudyMate AI")
 
 # ── Settings ─────────────────────────────────────────────────
 st.sidebar.header("⚙️ Settings")
-mode = st.sidebar.radio("Study Mode:", list(PERSONAS.keys()))
+st.sidebar.caption("💡 Study Mode now lives next to the prompt box below, so you can switch it per question.")
 temperature = st.sidebar.slider("Creativity Level", 0.0, 1.0, 0.3)
 # NOTE (Sept 2026): llama-3.3-70b-versatile and llama-3.1-8b-instant were
 # decommissioned by Groq on Aug 16, 2026. Replaced with their recommended
@@ -559,6 +572,7 @@ if input_mode == "📁 Upload a File":
             st.markdown(message["content"])
 
     if uploaded_file and "vectorstore" in st.session_state:
+        mode = render_mode_selector("study_mode")
         user_query = st.chat_input("❓ Ask a question about your file...")
         if user_query:
             with st.chat_message("user"):
@@ -624,6 +638,7 @@ elif input_mode in ["🖼️ Upload Image", "📷 Take a Photo"]:
             st.markdown(message["content"])
 
     if st.session_state.get("image_data"):
+        mode = render_mode_selector("study_mode")
         user_query = st.chat_input("❓ Ask a question about the image...")
         if user_query:
             with st.chat_message("user"):
@@ -732,6 +747,8 @@ elif input_mode == "✏️ Enter a Topic":
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+
+        mode = render_mode_selector("study_mode")
 
         # Auto-send a starter prompt only on the very first turn
         default_prompt = f"Let's start! Help me learn about: {current_topic}" if not st.session_state.messages else None
