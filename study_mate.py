@@ -750,11 +750,16 @@ elif input_mode == "✏️ Enter a Topic":
 
         mode = render_mode_selector("study_mode")
 
-        # Auto-send a starter prompt only on the very first turn
+        # The starter intro is no longer auto-fired the instant the topic
+        # loads — that used to run before the mode selector above had a
+        # chance to be seen or changed. Now it waits for an explicit click,
+        # so whatever mode is picked here is the one actually used.
         default_prompt = f"Let's start! Help me learn about: {current_topic}" if not st.session_state.messages else None
-        user_query = st.chat_input("❓ Ask anything about this topic...") or (
-            default_prompt if not st.session_state.messages else None
-        )
+        user_query = st.chat_input("❓ Ask anything about this topic...")
+
+        if not st.session_state.messages and not user_query:
+            if st.button(f"▶️ Begin studying ({mode})", use_container_width=True):
+                user_query = default_prompt
 
         if user_query:
             llm = ChatGroq(model=model_choice, temperature=temperature, api_key=groq_api_key)
